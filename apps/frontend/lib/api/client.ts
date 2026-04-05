@@ -56,8 +56,8 @@ export async function apiFetch(
     url = resolveRuntimeApiBase(normalizedEndpoint);
   }
 
-  // Matches the backend's 240s hard limit (resumes.py wait_for timeout)
-  const timeout = timeoutMs ?? 240_000;
+  // Increased timeout for slower LLM providers (10 minutes)
+  const timeout = timeoutMs ?? 600_000;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
 
