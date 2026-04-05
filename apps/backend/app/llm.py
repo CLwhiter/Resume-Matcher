@@ -12,6 +12,7 @@ from litellm.router import RetryPolicy
 from pydantic import BaseModel
 
 from app.config import settings
+from app.llm_monitor import classify_error, monitor, CallStatus, ErrorType
 
 LITELLM_LOGGER_NAMES = ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy")
 
@@ -404,8 +405,22 @@ async def check_llm_health(
     if config is None:
         config = get_llm_config()
 
+    # Start monitoring
+    request_id = monitor.start_call(
+        operation="health_check",
+        provider=config.provider,
+        model=config.model,
+        timeout=LLM_TIMEOUT_HEALTH_CHECK,
+    )
+
     # Check if API key is configured (except for Ollama)
     if config.provider != "ollama" and not config.api_key:
+        monitor.update_call(
+            request_id,
+            CallStatus.FAILED,
+            error_type=classify_error(Exception("API key missing")),
+            error_message="api_key_missing",
+        )
         return {
             "healthy": False,
             "provider": config.provider,
@@ -456,6 +471,13 @@ async def check_llm_health(
                 if include_details:
                     result["test_prompt"] = _to_code_block(prompt)
                     result["model_output"] = _to_code_block(None)
+
+                monitor.update_call(
+                    request_id,
+                    CallStatus.FAILED,
+                    error_type=classify_error(ValueError("empty_content")),
+                    error_message="LLM returned empty response",
+                )
                 return result
 
         result = {
@@ -467,6 +489,8 @@ async def check_llm_health(
         if include_details:
             result["test_prompt"] = _to_code_block(prompt)
             result["model_output"] = _to_code_block(content)
+
+        monitor.update_call(request_id, CallStatus.SUCCESS)
         return result
     except Exception as e:
         # Log full exception details server-side, but do not expose them to clients
@@ -474,6 +498,9 @@ async def check_llm_health(
             "LLM health check failed",
             extra={"provider": config.provider, "model": config.model},
         )
+
+        # Classify error for monitoring
+        error_type = classify_error(e)
 
         # Provide a minimal, actionable client-facing hint without leaking secrets.
         error_code = "health_check_failed"
@@ -494,6 +521,13 @@ async def check_llm_health(
             result["test_prompt"] = _to_code_block(prompt)
             result["model_output"] = _to_code_block(None)
             result["error_detail"] = _to_code_block(message)
+
+        monitor.update_call(
+            request_id,
+            CallStatus.FAILED,
+            error_type=error_type,
+            error_message=message,
+        )
         return result
 
 
@@ -510,6 +544,15 @@ async def complete(
     """
     router, config = get_router(config)
     model_name = get_model_name(config)
+
+    # Start monitoring
+    request_id = monitor.start_call(
+        operation="completion",
+        provider=config.provider,
+        model=model_name,
+        timeout=LLM_TIMEOUT_COMPLETION,
+        max_tokens=max_tokens,
+    )
 
     messages = []
     if system_prompt:
@@ -533,17 +576,39 @@ async def complete(
 
         content = _extract_choice_text(response.choices[0])
         if not content:
+            monitor.update_call(
+                request_id,
+                CallStatus.FAILED,
+                error_type=classify_error(ValueError("Empty response")),
+                error_message="Empty response from LLM",
+            )
             raise ValueError("Empty response from LLM")
         # Strip thinking tags from reasoning models (deepseek-r1, qwq, etc.)
         if "<think>" in content:
             content = _strip_thinking_tags(content)
             if not content:
+                monitor.update_call(
+                    request_id,
+                    CallStatus.FAILED,
+                    error_type=classify_error(ValueError("Response contained only thinking content")),
+                    error_message="Response contained only thinking content, no output",
+                )
                 raise ValueError("Response contained only thinking content, no output")
+
+        monitor.update_call(request_id, CallStatus.SUCCESS)
         return content
     except Exception as e:
         # Log the actual error server-side for debugging
         logging.error(f"LLM completion failed: {e}", extra={
                       "model": model_name})
+
+        error_type = classify_error(e)
+        monitor.update_call(
+            request_id,
+            CallStatus.FAILED,
+            error_type=error_type,
+            error_message=str(e),
+        )
         raise ValueError(
             "LLM completion failed. Please check your API configuration and try again."
         ) from e
@@ -761,6 +826,16 @@ async def complete_json(
     router, config = get_router(config)
     model_name = get_model_name(config)
 
+    # Start monitoring
+    timeout = _calculate_timeout("json", max_tokens, config.provider)
+    request_id = monitor.start_call(
+        operation="complete_json",
+        provider=config.provider,
+        model=model_name,
+        timeout=timeout,
+        max_tokens=max_tokens,
+    )
+
     # Build messages
     json_system = (
         system_prompt or ""
@@ -823,6 +898,7 @@ async def complete_json(
                     "Parsed JSON appears truncated on final attempt, proceeding with result"
                 )
 
+            monitor.update_call(request_id, CallStatus.SUCCESS, retry_count=attempt)
             return result
 
         except json.JSONDecodeError as e:
@@ -834,6 +910,13 @@ async def complete_json(
                     + "\n\nIMPORTANT: Output ONLY a valid JSON object. Start with { and end with }."
                 )
                 continue
+            monitor.update_call(
+                request_id,
+                CallStatus.FAILED,
+                error_type=classify_error(e),
+                error_message=str(e),
+                retry_count=attempt,
+            )
             raise ValueError(
                 f"Failed to parse JSON after {retries + 1} attempts: {e}")
 
@@ -842,12 +925,33 @@ async def complete_json(
             logging.warning(f"Content extraction failed (attempt {attempt + 1}): {e}")
             if attempt < retries:
                 continue
+            monitor.update_call(
+                request_id,
+                CallStatus.FAILED,
+                error_type=classify_error(e),
+                error_message=str(e),
+                retry_count=attempt,
+            )
             raise
 
-        except Exception:
+        except Exception as e:
             # Transport errors — Router already retried with backoff.
             # Cooldowns are disabled (see _build_router); no additional
             # retry is attempted here.
+            monitor.update_call(
+                request_id,
+                CallStatus.FAILED,
+                error_type=classify_error(e),
+                error_message=str(e),
+                retry_count=attempt,
+            )
             raise
 
+    monitor.update_call(
+        request_id,
+        CallStatus.FAILED,
+        error_type=ErrorType.UNKNOWN_ERROR,
+        error_message=f"Failed after {retries + 1} attempts",
+        retry_count=retries,
+    )
     raise ValueError(f"Failed after {retries + 1} attempts")
